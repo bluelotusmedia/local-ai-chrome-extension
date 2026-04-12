@@ -11,6 +11,9 @@ document.addEventListener('DOMContentLoaded', () => {
   const saveSettingsBtn = document.getElementById('save-settings-btn');
   const endpointUrlInput = document.getElementById('endpoint-url');
   
+  const modelSelect = document.getElementById('model-select');
+  const refreshModelsBtn = document.getElementById('refresh-models-btn');
+  
   const personaSelect = document.getElementById('persona-select');
   const customPromptContainer = document.getElementById('custom-prompt-container');
   const systemPromptInput = document.getElementById('system-prompt');
@@ -38,6 +41,7 @@ document.addEventListener('DOMContentLoaded', () => {
   let liveModeEnabled = false;
   let isGenerating = false;
   let activeUtterances = [];
+  let currentSelectedModel = "local-model";
 
   // Speech Recognition Setup
   const SpeechRecognition = window.SpeechRecognition || window.webkitSpeechRecognition;
@@ -152,6 +156,7 @@ document.addEventListener('DOMContentLoaded', () => {
     "blue-lotus": "You’re Blue Lotus AI, the creative mastermind behind Blue Lotus Media. Your mission: help clients turn bold ideas into pixel-perfect, user-loving digital experiences. You’re fluent in web dev, graphic design, UI/UX, branding, marketing, e-commerce, SEO, and social media. You speak in a friendly yet professional tone, sprinkle industry jargon when it matters, but always keep explanations clear and actionable. You’re ready to draft copy, brainstorm concepts, debug code snippets, or design a brand identity—all while staying true to the brand’s mission of ‘empowering businesses and artists with cutting-edge creative content that captures the essence of their brand identity.",
     "reviewer": "You are a strict, senior code reviewer. You analyze code for security, performance, readability, and best practices. Point out every flaw, suggest optimizations, and provide corrected code examples. Be direct and concise. Ensure the context provided by the user is used efficiently.",
     "copywriter": "You are an expert SEO copywriter and marketer. Your goal is to rewrite or generate text that drives conversions, captures attention, and ranks high on search engines. Use persuasive language, strong hooks, and clear calls to action based on the context provided.",
+    "financial": "You are a specialized Financial, Trading, and Tax Assistant. You help users analyze financial texts, digest stock market news, explain algorithmic trading strategies, and summarize tax documents. You provide clear, data-driven, and objective explanations. CRITICAL RULE: You must always append a brief disclaimer to your responses explicitly stating that you are an AI, this information is for educational purposes only, and it does not constitute verified financial, legal, or tax advice.",
     "general": "You are a helpful AI assistant. You are given the content of a webpage. Answer the user's questions based on this webpage's content."
   };
 
@@ -164,8 +169,44 @@ document.addEventListener('DOMContentLoaded', () => {
     }
   });
 
+  // Fetch Models
+  async function fetchAvailableModels(savedModel = null) {
+      const chatUrl = endpointUrlInput.value;
+      const baseUrl = chatUrl.replace(/\/chat\/completions\/?$/, '/models');
+      
+      try {
+          const res = await fetch(baseUrl);
+          if (!res.ok) throw new Error("Failed to fetch");
+          const data = await res.json();
+          
+          if (data && data.data && Array.isArray(data.data)) {
+              modelSelect.innerHTML = "";
+              data.data.forEach(model => {
+                 const option = document.createElement("option");
+                 option.value = model.id;
+                 option.textContent = model.id;
+                 modelSelect.appendChild(option);
+              });
+              
+              if (savedModel && Array.from(modelSelect.options).some(opt => opt.value === savedModel)) {
+                  modelSelect.value = savedModel;
+                  currentSelectedModel = savedModel;
+              } else if (modelSelect.options.length > 0) {
+                  currentSelectedModel = modelSelect.options[0].value;
+              }
+          }
+      } catch (err) {
+          console.warn("Could not fetch models:", err);
+          modelSelect.innerHTML = `<option value="${currentSelectedModel}">${currentSelectedModel} (Offline)</option>`;
+      }
+  }
+
+  if (refreshModelsBtn) {
+      refreshModelsBtn.addEventListener('click', () => fetchAvailableModels(modelSelect.value));
+  }
+
   // Load Settings
-  chrome.storage.local.get(['lmServerUrl', 'systemPrompt', 'personaSelection'], (res) => {
+  chrome.storage.local.get(['lmServerUrl', 'systemPrompt', 'personaSelection', 'selectedModel'], (res) => {
     if (res.lmServerUrl) endpointUrlInput.value = res.lmServerUrl;
     
     if (res.personaSelection) {
@@ -185,6 +226,11 @@ document.addEventListener('DOMContentLoaded', () => {
     if (res.systemPrompt && personaSelect.value === 'custom') {
       systemPromptInput.value = res.systemPrompt;
     }
+    
+    if (res.selectedModel) {
+      currentSelectedModel = res.selectedModel;
+    }
+    fetchAvailableModels(currentSelectedModel);
   });
 
   // Quick Actions binding
@@ -202,10 +248,12 @@ document.addEventListener('DOMContentLoaded', () => {
   });
 
   saveSettingsBtn.addEventListener('click', () => {
+    currentSelectedModel = modelSelect.value;
     chrome.storage.local.set({
       lmServerUrl: endpointUrlInput.value,
       systemPrompt: systemPromptInput.value,
-      personaSelection: personaSelect.value
+      personaSelection: personaSelect.value,
+      selectedModel: currentSelectedModel
     }, () => {
       settingsPanel.classList.add('hidden');
     });
@@ -458,7 +506,7 @@ document.addEventListener('DOMContentLoaded', () => {
           'Content-Type': 'application/json'
         },
         body: JSON.stringify({
-          model: "local-model", // LM Studio ignores this usually
+          model: currentSelectedModel,
           messages: payloadMessages,
           stream: true,
           temperature: 0.7
