@@ -10,13 +10,29 @@ document.addEventListener('DOMContentLoaded', () => {
   const settingsPanel = document.getElementById('settings-panel');
   const saveSettingsBtn = document.getElementById('save-settings-btn');
   const endpointUrlInput = document.getElementById('endpoint-url');
+  
+  const personaSelect = document.getElementById('persona-select');
+  const customPromptContainer = document.getElementById('custom-prompt-container');
   const systemPromptInput = document.getElementById('system-prompt');
   
   const micBtn = document.getElementById('mic-btn');
+  const quickActionBtns = document.querySelectorAll('.quick-action-btn');
+  
+  // Initialize marked for code highlighting
+  if (window.marked && window.hljs) {
+    marked.setOptions({
+      highlight: function(code, lang) {
+        const language = window.hljs.getLanguage(lang) ? lang : 'plaintext';
+        return window.hljs.highlight(code, { language }).value;
+      },
+      langPrefix: 'hljs language-'
+    });
+  }
   
   let pageContext = "";
   let pageTitle = "";
   let messages = [];
+  let activeTabUrl = "";
 
   // Speech Recognition Setup
   const SpeechRecognition = window.SpeechRecognition || window.webkitSpeechRecognition;
@@ -85,10 +101,52 @@ document.addEventListener('DOMContentLoaded', () => {
     });
   }
 
+  const personas = {
+    "blue-lotus": "You’re Blue Lotus AI, the creative mastermind behind Blue Lotus Media. Your mission: help clients turn bold ideas into pixel-perfect, user-loving digital experiences. You’re fluent in web dev, graphic design, UI/UX, branding, marketing, e-commerce, SEO, and social media. You speak in a friendly yet professional tone, sprinkle industry jargon when it matters, but always keep explanations clear and actionable. You’re ready to draft copy, brainstorm concepts, debug code snippets, or design a brand identity—all while staying true to the brand’s mission of ‘empowering businesses and artists with cutting-edge creative content that captures the essence of their brand identity.",
+    "reviewer": "You are a strict, senior code reviewer. You analyze code for security, performance, readability, and best practices. Point out every flaw, suggest optimizations, and provide corrected code examples. Be direct and concise. Ensure the context provided by the user is used efficiently.",
+    "copywriter": "You are an expert SEO copywriter and marketer. Your goal is to rewrite or generate text that drives conversions, captures attention, and ranks high on search engines. Use persuasive language, strong hooks, and clear calls to action based on the context provided.",
+    "general": "You are a helpful AI assistant. You are given the content of a webpage. Answer the user's questions based on this webpage's content."
+  };
+
+  personaSelect.addEventListener('change', (e) => {
+    if (e.target.value === 'custom') {
+      customPromptContainer.style.display = 'block';
+    } else {
+      customPromptContainer.style.display = 'none';
+      systemPromptInput.value = personas[e.target.value];
+    }
+  });
+
   // Load Settings
-  chrome.storage.local.get(['lmServerUrl', 'systemPrompt'], (res) => {
+  chrome.storage.local.get(['lmServerUrl', 'systemPrompt', 'personaSelection'], (res) => {
     if (res.lmServerUrl) endpointUrlInput.value = res.lmServerUrl;
-    if (res.systemPrompt) systemPromptInput.value = res.systemPrompt;
+    
+    if (res.personaSelection) {
+      personaSelect.value = res.personaSelection;
+      if (res.personaSelection === 'custom') {
+        customPromptContainer.style.display = 'block';
+      } else {
+         systemPromptInput.value = personas[res.personaSelection];
+      }
+    } else {
+      // Default to Blue Lotus
+      personaSelect.value = 'blue-lotus';
+      systemPromptInput.value = personas['blue-lotus'];
+    }
+    
+    // Only overwrite with saved custom prompt if in custom mode
+    if (res.systemPrompt && personaSelect.value === 'custom') {
+      systemPromptInput.value = res.systemPrompt;
+    }
+  });
+
+  // Quick Actions binding
+  quickActionBtns.forEach(btn => {
+    btn.addEventListener('click', () => {
+       const prompt = btn.getAttribute('data-prompt');
+       userInput.value = prompt;
+       chatForm.dispatchEvent(new Event('submit'));
+    });
   });
 
   // Settings Panel Toggle
@@ -99,7 +157,8 @@ document.addEventListener('DOMContentLoaded', () => {
   saveSettingsBtn.addEventListener('click', () => {
     chrome.storage.local.set({
       lmServerUrl: endpointUrlInput.value,
-      systemPrompt: systemPromptInput.value
+      systemPrompt: systemPromptInput.value,
+      personaSelection: personaSelect.value
     }, () => {
       settingsPanel.classList.add('hidden');
     });
@@ -119,21 +178,16 @@ document.addEventListener('DOMContentLoaded', () => {
   });
 
   // Refresh Context Action
-  refreshContextBtn.addEventListener('click', loadPageContext);
+  if (refreshContextBtn) {
+    refreshContextBtn.addEventListener('click', () => loadPageContext(true));
+  }
 
   // Initialize
-  loadPageContext();
+  loadPageContext(false);
 
-  function loadPageContext() {
-    // Clear chat history and state
-    messages = [];
-    chatHistory.innerHTML = '';
-    
+  function loadPageContext(clearChat = false) {
     contextPill.innerText = "Loading context...";
     contextPill.classList.remove('error');
-    
-    // Add initial system message or a refresh indicator
-    appendMessage('system', "Context refreshed. Starting a new conversation about the current page.");
     
     // Get active tab and send message to content script
     chrome.tabs.query({ active: true, currentWindow: true }, (tabs) => {
@@ -143,18 +197,34 @@ document.addEventListener('DOMContentLoaded', () => {
       }
       
       const targetTab = tabs[0];
+      activeTabUrl = targetTab.url;
       
-      if (!targetTab.url || targetTab.url.startsWith('chrome://') || targetTab.url.startsWith('edge://') || targetTab.url.startsWith('about:') || targetTab.url.startsWith('brave://')) {
+      if (!activeTabUrl || activeTabUrl.startsWith('chrome://') || activeTabUrl.startsWith('edge://') || activeTabUrl.startsWith('about:') || activeTabUrl.startsWith('brave://')) {
         setContextError("Cannot read browser pages.");
         return;
       }
       
+      // Load History for this URL
+      chrome.storage.local.get([activeTabUrl], (res) => {
+        if (clearChat) {
+          messages = [];
+          chrome.storage.local.remove([activeTabUrl]);
+        } else {
+          messages = res[activeTabUrl] || [];
+        }
+        
+        chatHistory.innerHTML = '';
+        if (messages.length === 0) {
+           appendMessage('system', "Context loaded. Starting a new conversation about the current page.");
+        } else {
+           messages.forEach(msg => appendMessage(msg.role, msg.content));
+        }
+      });
+      
       // Try sending message first as content scripts may already be running
       chrome.tabs.sendMessage(targetTab.id, { action: "getPageContent" }, (response) => {
         if (!chrome.runtime.lastError && response) {
-          pageContext = response.content;
-          pageTitle = response.title;
-          contextPill.innerText = `Context: ${pageTitle.substring(0, 20)}...`;
+          handleContextResponse(response);
         } else {
           // Attempt to execute the content script first just in case it hasn't run
           chrome.scripting.executeScript({
@@ -164,12 +234,9 @@ document.addEventListener('DOMContentLoaded', () => {
             chrome.tabs.sendMessage(targetTab.id, { action: "getPageContent" }, (response2) => {
               if (chrome.runtime.lastError || !response2) {
                 setContextError("Could not read page.");
-                console.error(chrome.runtime.lastError);
                 return;
               }
-              pageContext = response2.content;
-              pageTitle = response2.title;
-              contextPill.innerText = `Context: ${pageTitle.substring(0, 20)}...`;
+              handleContextResponse(response2);
             });
           }).catch(err => {
             setContextError("Cannot run on this page.");
@@ -178,6 +245,23 @@ document.addEventListener('DOMContentLoaded', () => {
         }
       });
     });
+  }
+
+  function handleContextResponse(response) {
+    pageContext = response.content;
+    pageTitle = response.title;
+    if (response.type === 'selection') {
+       contextPill.innerText = `Context: Highlighted Text`;
+    } else {
+       contextPill.innerText = `Context: ${pageTitle.substring(0, 20)}...`;
+    }
+    contextPill.classList.remove('error');
+  }
+
+  function saveChatMemory() {
+    if (activeTabUrl) {
+      chrome.storage.local.set({ [activeTabUrl]: messages });
+    }
   }
 
   function setContextError(msg) {
@@ -197,7 +281,7 @@ document.addEventListener('DOMContentLoaded', () => {
     textDiv.className = 'message-text';
     contentDiv.appendChild(textDiv);
 
-    if (role === 'ai') {
+    if (role === 'ai' || role === 'assistant') {
       textDiv.innerHTML = formatMarkdown(content);
       
       const actionsDiv = document.createElement('div');
@@ -268,8 +352,12 @@ document.addEventListener('DOMContentLoaded', () => {
     chatHistory.scrollTop = chatHistory.scrollHeight;
   }
 
-  // A very basic markdown formatter for bold and code blocks
+  // A very basic markdown formatter for bold and code blocks, with 'marked' feature
   function formatMarkdown(text) {
+    if (window.marked) {
+      return marked.parse(text);
+    }
+    
     let formatted = text
       .replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;") // sanitize
       .replace(/\*\*(.*?)\*\*/g, '<strong>$1</strong>')
@@ -300,6 +388,7 @@ document.addEventListener('DOMContentLoaded', () => {
     // Add user msg to UI
     appendMessage('user', text);
     messages.push({ role: "user", content: text });
+    saveChatMemory();
 
     // Prepare system prompt with context
     const sysPrompt = systemPromptInput.value;
@@ -363,6 +452,7 @@ document.addEventListener('DOMContentLoaded', () => {
       // Finished
       aiContentDiv.innerHTML = formatMarkdown(botFullText);
       messages.push({ role: "assistant", content: botFullText });
+      saveChatMemory();
 
     } catch (err) {
       console.error(err);

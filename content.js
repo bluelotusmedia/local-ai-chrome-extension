@@ -1,5 +1,10 @@
 // Extract the main readable text from the page.
 function extractPageContent() {
+  const selection = window.getSelection().toString().trim();
+  if (selection.length > 0) {
+    return { text: selection, type: "selection" };
+  }
+
   const documentClone = document.cloneNode(true);
   
   // Remove scripts, styles, nav, footers
@@ -27,7 +32,7 @@ function extractPageContent() {
   if (text.length > MAX_CHARS) {
     text = text.substring(0, MAX_CHARS) + "\n...[Content truncated due to length]";
   }
-  return text;
+  return { text: text, type: "full-page" };
 }
 
 // Listen for messages from the side panel
@@ -35,7 +40,7 @@ chrome.runtime.onMessage.addListener((request, sender, sendResponse) => {
   if (request.action === "getPageContent") {
     const title = document.title;
     const url = window.location.href;
-    const content = extractPageContent();
-    sendResponse({ title, url, content });
+    const contentObj = extractPageContent();
+    sendResponse({ title, url, content: contentObj.text, type: contentObj.type });
   }
 });

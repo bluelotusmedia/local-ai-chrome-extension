@@ -314,23 +314,62 @@ body {
   position: relative;
 }
 
+.context-row {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  gap: 0.5rem;
+  width: 100%;
+}
+
 .context-pill {
   font-size: 0.7rem;
   background-color: rgba(16, 185, 129, 0.1);
   color: #10b981;
   padding: 0.2rem 0.6rem;
   border-radius: 1rem;
-  align-self: flex-start;
   display: flex;
   align-items: center;
   gap: 0.3rem;
   border: 1px solid rgba(16, 185, 129, 0.2);
+  white-space: nowrap;
+  flex-shrink: 0;
 }
 
 .context-pill.error {
   background-color: rgba(239, 68, 68, 0.1);
   color: #ef4444;
   border-color: rgba(239, 68, 68, 0.2);
+}
+
+.quick-actions {
+  display: flex;
+  gap: 0.4rem;
+  overflow-x: auto;
+  align-items: center;
+  scrollbar-width: none; /* Firefox */
+}
+.quick-actions::-webkit-scrollbar {
+  display: none;
+}
+
+.quick-action-btn {
+  background-color: transparent;
+  color: var(--text-muted);
+  border: 1px solid var(--border-color);
+  border-radius: 1rem;
+  padding: 0.2rem 0.6rem;
+  font-size: 0.7rem;
+  font-family: inherit;
+  cursor: pointer;
+  white-space: nowrap;
+  transition: all 0.2s ease;
+}
+
+.quick-action-btn:hover {
+  background-color: var(--bg-surface-hover);
+  color: var(--text-main);
+  border-color: var(--text-muted);
 }
 
 #chat-form {

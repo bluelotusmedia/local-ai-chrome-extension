@@ -5,7 +5,10 @@
   <meta name="viewport" content="width=device-width, initial-scale=1.0">
   <title>Local AI Chat</title>
   <link rel="stylesheet" href="sidepanel.css">
+  <link rel="stylesheet" href="assets/github-dark.min.css">
   <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600&display=swap" rel="stylesheet">
+  <script src="assets/marked.min.js"></script>
+  <script src="assets/highlight.min.js"></script>
 </head>
 <body>
   <div class="container">
@@ -30,8 +33,18 @@
         <input type="text" id="endpoint-url" value="http://localhost:1234/v1/chat/completions">
       </div>
       <div class="form-group">
-        <label for="system-prompt">System Prompt</label>
-        <textarea id="system-prompt" rows="3">You are a helpful AI assistant. You are given the content of a webpage. Answer the user's questions based on this webpage's content.</textarea>
+        <label for="persona-select">Persona / Mode</label>
+        <select id="persona-select">
+           <option value="blue-lotus">Blue Lotus AI (Default)</option>
+           <option value="reviewer">Strict Code Reviewer</option>
+           <option value="copywriter">SEO Copywriter</option>
+           <option value="general">General Assistant</option>
+           <option value="custom">Custom</option>
+        </select>
+      </div>
+      <div class="form-group" id="custom-prompt-container" style="display: none;">
+        <label for="system-prompt">Custom Prompt</label>
+        <textarea id="system-prompt" rows="4">You are a helpful AI assistant. You are given the content of a webpage. Answer the user's questions based on this webpage's content.</textarea>
       </div>
       <button id="save-settings-btn" class="primary-btn">Save Settings</button>
     </div>
@@ -45,8 +58,16 @@
       </div>
       
       <div class="input-area">
-        <div class="context-pill" id="context-pill" title="Page context loaded">
-          Context Loaded
+        <div class="context-row">
+          <div class="context-pill" id="context-pill" title="Page context loaded">
+            Context Loaded
+          </div>
+          <div class="quick-actions" id="quick-actions">
+            <button class="quick-action-btn" data-prompt="Summarize the main points concisely.">Summarize</button>
+            <button class="quick-action-btn" data-prompt="What are the key takeaways?">Takeaways</button>
+            <button class="quick-action-btn" data-prompt="Explain this simply.">Explain</button>
+            <button class="quick-action-btn" data-prompt="Extract action items or tasks.">Action Items</button>
+          </div>
         </div>
         <form id="chat-form">
           <textarea id="user-input" placeholder="Ask something..." rows="1" required></textarea>
