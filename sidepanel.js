@@ -12,9 +12,78 @@ document.addEventListener('DOMContentLoaded', () => {
   const endpointUrlInput = document.getElementById('endpoint-url');
   const systemPromptInput = document.getElementById('system-prompt');
   
+  const micBtn = document.getElementById('mic-btn');
+  
   let pageContext = "";
   let pageTitle = "";
   let messages = [];
+
+  // Speech Recognition Setup
+  const SpeechRecognition = window.SpeechRecognition || window.webkitSpeechRecognition;
+  let recognition = null;
+  let isListening = false;
+  
+  if (SpeechRecognition) {
+    recognition = new SpeechRecognition();
+    recognition.continuous = false;
+    recognition.interimResults = true;
+    
+    recognition.onstart = () => {
+      isListening = true;
+      micBtn.classList.add('listening');
+      userInput.placeholder = "Listening...";
+    };
+    
+    recognition.onresult = (event) => {
+      let finalTranscript = '';
+      let interimTranscript = '';
+      for (let i = event.resultIndex; i < event.results.length; ++i) {
+        if (event.results[i].isFinal) {
+          finalTranscript += event.results[i][0].transcript;
+        } else {
+          interimTranscript += event.results[i][0].transcript;
+        }
+      }
+      userInput.value = finalTranscript || interimTranscript;
+    };
+    
+    recognition.onerror = (event) => {
+      console.error("Speech recognition error", event.error);
+      if(event.error === 'not-allowed') {
+         alert("Microphone access denied. Please open the Extension Options page to grant microphone access.");
+         window.open(chrome.runtime.getURL("options.html"));
+      }
+      stopListening();
+    };
+    
+    recognition.onend = () => {
+      stopListening();
+      if (userInput.value.trim().length > 0) {
+        chatForm.dispatchEvent(new Event('submit'));
+      }
+    };
+  }
+
+  function stopListening() {
+    isListening = false;
+    if (micBtn) micBtn.classList.remove('listening');
+    userInput.placeholder = "Ask something...";
+  }
+
+  if (micBtn) {
+    micBtn.addEventListener('click', () => {
+      if (!recognition) return alert("Speech Recognition not supported in this browser.");
+      
+      if (isListening) {
+        recognition.stop();
+      } else {
+        // stop TTS if trying to talk
+        window.speechSynthesis.cancel();
+        userInput.value = "";
+        recognition.start();
+      }
+    });
+  }
 
   // Load Settings
   chrome.storage.local.get(['lmServerUrl', 'systemPrompt'], (res) => {
@@ -131,6 +200,39 @@ document.addEventListener('DOMContentLoaded', () => {
     if (role === 'ai') {
       textDiv.innerHTML = formatMarkdown(content);
       
+      const actionsDiv = document.createElement('div');
+      actionsDiv.className = 'message-actions';
+
+      // Add Play Audio Button
+      const playBtn = document.createElement('button');
+      playBtn.className = 'play-btn';
+      playBtn.title = 'Play Audio';
+      playBtn.innerHTML = `<svg xmlns="http://www.w3.org/2000/svg" width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><polygon points="11 5 6 9 2 9 2 15 6 15 11 19 11 5"></polygon><path d="M19.07 4.93a10 10 0 0 1 0 14.14M15.54 8.46a5 5 0 0 1 0 7.07"></path></svg>`;
+      
+      let isPlaying = false;
+      playBtn.addEventListener('click', () => {
+        if (isPlaying) {
+          window.speechSynthesis.cancel();
+          isPlaying = false;
+          playBtn.classList.remove('playing');
+          actionsDiv.classList.remove('playing');
+        } else {
+          window.speechSynthesis.cancel(); // stop any previous
+          const textToSpeak = textDiv.innerText;
+          const utterance = new SpeechSynthesisUtterance(textToSpeak);
+          utterance.onend = () => {
+             isPlaying = false;
+             playBtn.classList.remove('playing');
+             actionsDiv.classList.remove('playing');
+          };
+          window.speechSynthesis.speak(utterance);
+          isPlaying = true;
+          playBtn.classList.add('playing');
+          actionsDiv.classList.add('playing');
+        }
+      });
+      actionsDiv.appendChild(playBtn);
+
       // Add Copy Button
       const copyBtn = document.createElement('button');
       copyBtn.className = 'copy-btn';
@@ -149,7 +251,9 @@ document.addEventListener('DOMContentLoaded', () => {
           }, 2000);
         });
       });
-      contentDiv.appendChild(copyBtn);
+      actionsDiv.appendChild(copyBtn);
+      
+      contentDiv.appendChild(actionsDiv);
     } else {
       textDiv.textContent = content; // Escape user text
     }
@@ -180,6 +284,13 @@ document.addEventListener('DOMContentLoaded', () => {
     e.preventDefault();
     const text = userInput.value.trim();
     if (!text) return;
+
+    // Stop speaking and listening
+    window.speechSynthesis.cancel();
+    if (isListening && recognition) {
+       recognition.stop();
+       stopListening();
+    }
 
     // Reset input
     userInput.value = '';

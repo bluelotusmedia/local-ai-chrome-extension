@@ -24,6 +24,7 @@
   "side_panel": {
     "default_path": "sidepanel.html"
   },
+  "options_page": "options.html",
   "icons": {
     "16": "icon128.png",
     "32": "icon128.png",
