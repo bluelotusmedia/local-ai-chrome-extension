@@ -22,6 +22,7 @@ document.addEventListener('DOMContentLoaded', () => {
   const micBtn = document.getElementById('mic-btn');
   const liveModeToggleBtn = document.getElementById('live-mode-toggle-btn');
   const liveMuteToggleBtn = document.getElementById('live-mute-toggle-btn');
+  const webAccessToggle = document.getElementById('web-access-toggle');
   const quickActionBtns = document.querySelectorAll('.quick-action-btn');
   
   const attachBtn = document.getElementById('attach-btn');
@@ -53,6 +54,7 @@ document.addEventListener('DOMContentLoaded', () => {
   
   let liveModeEnabled = false;
   let liveMuted = false;
+  let webAccessEnabled = false;
   let isGenerating = false;
   let activeUtterances = [];
   let currentSelectedModel = "local-model";
@@ -101,6 +103,9 @@ document.addEventListener('DOMContentLoaded', () => {
       stopListening();
       if (userInput.value.trim().length > 0) {
         chatForm.dispatchEvent(new Event('submit'));
+      } else {
+        // If it naturally times out without dictation, but live mode is active, restart it immediately
+        checkAutoListenRestart();
       }
     };
   }
@@ -431,6 +436,11 @@ document.addEventListener('DOMContentLoaded', () => {
       currentSelectedVoiceURI = res.selectedVoiceURI;
       if (voiceSelect) voiceSelect.value = currentSelectedVoiceURI;
     }
+    
+    if (res.webAccessEnabled !== undefined) {
+      webAccessEnabled = res.webAccessEnabled;
+      if (webAccessToggle) webAccessToggle.checked = webAccessEnabled;
+    }
   });
 
   // Quick Actions binding
@@ -458,12 +468,14 @@ document.addEventListener('DOMContentLoaded', () => {
   saveSettingsBtn.addEventListener('click', () => {
     currentSelectedModel = modelSelect.value;
     currentSelectedVoiceURI = voiceSelect ? voiceSelect.value : "default";
+    webAccessEnabled = webAccessToggle ? webAccessToggle.checked : false;
     chrome.storage.local.set({
       lmServerUrl: endpointUrlInput.value,
       systemPrompt: systemPromptInput.value,
       personaSelection: personaSelect.value,
       selectedModel: currentSelectedModel,
-      selectedVoiceURI: currentSelectedVoiceURI
+      selectedVoiceURI: currentSelectedVoiceURI,
+      webAccessEnabled: webAccessEnabled
     }, () => {
       settingsPanel.classList.add('hidden');
     });
@@ -605,6 +617,27 @@ document.addEventListener('DOMContentLoaded', () => {
     contextPill.innerText = msg;
     contextPill.classList.add('error');
     pageContext = "";
+  }
+
+  async function performWebSearch(query) {
+    try {
+      const res = await fetch(`https://html.duckduckgo.com/html/?q=${encodeURIComponent(query)}`);
+      const text = await res.text();
+      const parser = new DOMParser();
+      const doc = parser.parseFromString(text, 'text/html');
+      const results = doc.querySelectorAll('.result__snippet');
+      let searchContext = "";
+      results.forEach((el, index) => {
+         if (index < 5) {
+            searchContext += `- ${el.textContent.trim()}\n`;
+         }
+      });
+      if (!searchContext) return "No results found.";
+      return searchContext;
+    } catch(e) {
+      console.error("Web Search Error:", e);
+      return "Web search failed due to a network error.";
+    }
   }
 
   function appendMessage(role, content) {
@@ -767,40 +800,70 @@ document.addEventListener('DOMContentLoaded', () => {
     }
     const fullSystemMessage = `${sysPrompt}\n\nPAGE CONTEXT:\n${pageContext}`;
 
-    // Prepare history payload mapping out UI-only fields to avoid schema errors
     const cleanedMessages = messages.map(m => ({ role: m.role, content: m.content }));
     const payloadMessages = [
       { role: "system", content: fullSystemMessage },
       ...cleanedMessages
     ];
 
+    await streamLLMResponse(payloadMessages, true);
+  });
+  
+  async function streamLLMResponse(payloadMsgs, isInitialCall = false) {
     const aiContentDiv = appendMessage('ai', '');
     aiContentDiv.innerHTML = '<span class="typing-cursor"></span>';
     
+    let requestPayload = {
+       model: currentSelectedModel,
+       messages: payloadMsgs,
+       stream: true,
+       temperature: 0.7
+    };
+    
+    if (webAccessEnabled) {
+       requestPayload.tools = [
+         {
+           type: "function",
+           function: {
+             name: "search_web",
+             description: "Searches DuckDuckGo for live facts or anything you don't know.",
+             parameters: {
+               type: "object",
+               properties: { query: { type: "string" } },
+               required: ["query"]
+             }
+           }
+         }
+       ];
+       requestPayload.tool_choice = "auto";
+    }
+
     try {
       const response = await fetch(endpointUrlInput.value, {
         method: 'POST',
-        headers: {
-          'Content-Type': 'application/json'
-        },
-        body: JSON.stringify({
-          model: currentSelectedModel,
-          messages: payloadMessages,
-          stream: true,
-          temperature: 0.7
-        })
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(requestPayload)
       });
 
       if (!response.ok) {
-        throw new Error(`Server error: ${response.status} ${response.statusText}`);
+         let errorMsg = `Server error: ${response.status} ${response.statusText}`;
+         try {
+            const errData = await response.json();
+            if (errData && errData.error && errData.error.message) {
+               errorMsg = errData.error.message;
+            } else if (errData && errData.message) {
+               errorMsg = errData.message;
+            }
+         } catch(e) {}
+         throw new Error(errorMsg);
       }
 
       const reader = response.body.getReader();
       const decoder = new TextDecoder("utf-8");
       let botFullText = "";
-      
       let sentenceBuffer = "";
       isGenerating = true;
+      let toolCallsList = {};
 
       // Stream response
       while (true) {
@@ -814,54 +877,131 @@ document.addEventListener('DOMContentLoaded', () => {
           if (line.startsWith('data: ') && line !== 'data: [DONE]') {
             try {
               const data = JSON.parse(line.substring(6));
-              if (data.choices && data.choices[0].delta && data.choices[0].delta.content) {
-                const newText = data.choices[0].delta.content;
-                botFullText += newText;
-                
-                if (liveModeEnabled && !liveMuted) {
-                  sentenceBuffer += newText;
-                  let match;
-                  // Look for punctuation followed by space or newline
-                  while ((match = sentenceBuffer.match(/([^\.!\?\n]+[\.!\?\n]+)(\s|$)/))) {
-                    const fullMatch = match[0];
-                    const textToSpeak = fullMatch.replace(/[\*`#_]/g, '').trim();
-                    if (textToSpeak) {
-                      speakSentence(textToSpeak);
+              if (data.choices && data.choices[0].delta) {
+                 const delta = data.choices[0].delta;
+                 
+                 // Intercept Tool Calls
+                 if (delta.tool_calls) {
+                    for (const tc of delta.tool_calls) {
+                        const idx = tc.index !== undefined ? tc.index : 0;
+                        if (!toolCallsList[idx]) toolCallsList[idx] = { id: "", name: "", args: "" };
+                        if (tc.id) toolCallsList[idx].id = tc.id;
+                        if (tc.function && tc.function.name) toolCallsList[idx].name = tc.function.name;
+                        if (tc.function && tc.function.arguments) toolCallsList[idx].args += tc.function.arguments;
                     }
-                    sentenceBuffer = sentenceBuffer.substring(match.index + fullMatch.length);
-                  }
-                }
-                
-                aiContentDiv.innerHTML = formatMarkdown(botFullText) + '<span class="typing-cursor"></span>';
-                scrollToBottom();
+                 }
+                 // Handle Normal Text
+                 else if (delta.content) {
+                    const newText = delta.content;
+                    botFullText += newText;
+                    
+                    if (liveModeEnabled && !liveMuted) {
+                      sentenceBuffer += newText;
+                      let match;
+                      while ((match = sentenceBuffer.match(/([^\.!\?\n]+[\.!\?\n]+)(\s|$)/))) {
+                        const fullMatch = match[0];
+                        const textToSpeak = fullMatch.replace(/[\*`#_]/g, '').trim();
+                        if (textToSpeak) { speakSentence(textToSpeak); }
+                        sentenceBuffer = sentenceBuffer.substring(match.index + fullMatch.length);
+                      }
+                    }
+                    if (botFullText.includes('<|tool_call>')) {
+                        aiContentDiv.innerHTML = '<em>⚙️ Preparing tool interaction...</em>';
+                    } else {
+                        aiContentDiv.innerHTML = formatMarkdown(botFullText) + '<span class="typing-cursor"></span>';
+                    }
+                    scrollToBottom();
+                 }
               }
-            } catch (err) {
-              console.error("Error parsing stream delta:", err);
-            }
+            } catch (err) {}
           }
         }
       }
-      
-      if (liveModeEnabled && !liveMuted && sentenceBuffer.trim() !== "") {
-         speakSentence(sentenceBuffer.replace(/[\*`#_]/g, '').trim());
+      // If model bypassed JSON and leaked raw MLX format into content string
+      if (Object.keys(toolCallsList).length === 0 && botFullText.includes('<|tool_call>')) {
+         const toolMatches = [...botFullText.matchAll(/call:([a-zA-Z0-9_]+)\s*\{(.*?)\}/g)];
+         toolMatches.forEach((match, idx) => {
+            toolCallsList[idx] = {
+               id: "call_" + Math.random().toString(36).substring(7),
+               name: match[1],
+               args: "{" + match[2].replace(/<\|"\|>/g, '"') + "}"
+            };
+         });
+      }
+
+      const validToolCalls = Object.values(toolCallsList).filter(t => t.name === 'search_web');
+
+      // Handle tool call resolution and recursion
+      if (validToolCalls.length > 0) {
+         aiContentDiv.parentElement.remove(); // remove temp bot box
+         const tempSearchDiv = appendMessage('system', `<em>🔍 Executing ${validToolCalls.length} DuckDuckGo search(es)...</em>`);
+         
+         let assistantToolHistory = [];
+         let toolResponses = [];
+         
+         for (const tConfig of validToolCalls) {
+             let parsedArgs = { query: "search" };
+             try { parsedArgs = JSON.parse(tConfig.args); } catch(e){}
+             
+             const searchResult = await performWebSearch(parsedArgs.query);
+             
+             assistantToolHistory.push({
+                 id: tConfig.id,
+                 type: "function",
+                 function: { name: "search_web", arguments: tConfig.args }
+             });
+             
+             toolResponses.push({
+                 role: "tool",
+                 tool_call_id: tConfig.id,
+                 name: "search_web",
+                 content: searchResult
+             });
+         }
+         
+         payloadMsgs.push({
+            role: "assistant",
+            content: null,
+            tool_calls: assistantToolHistory
+         });
+         
+         toolResponses.forEach(tr => payloadMsgs.push(tr));
+         
+         tempSearchDiv.parentElement.remove();
+         await streamLLMResponse(payloadMsgs, false);
+         return;
       }
       
-      // Finished
-      aiContentDiv.innerHTML = formatMarkdown(botFullText);
-      messages.push({ role: "assistant", content: botFullText });
-      saveChatMemory();
+      // Finished normally
+      if (botFullText.trim() !== "") {
+         if (liveModeEnabled && !liveMuted && sentenceBuffer.trim() !== "") {
+            speakSentence(sentenceBuffer.replace(/[\*`#_]/g, '').trim());
+         }
+         aiContentDiv.innerHTML = formatMarkdown(botFullText);
+         messages.push({ role: "assistant", content: botFullText });
+         saveChatMemory();
+      } else if (botFullText.trim() === "" && validToolCalls.length === 0) {
+         aiContentDiv.parentElement.remove(); // cleanup empties
+      }
+      
       isGenerating = false;
       checkAutoListenRestart();
 
     } catch (err) {
       console.error(err);
       isGenerating = false;
-      aiContentDiv.innerHTML = `<em>Error: Could not connect to LM Studio. Ensure the local server is running at ${endpointUrlInput.value}</em>`;
+      let displayError = `<em>Error: Could not connect to LM Studio. Ensure the local server is running at ${endpointUrlInput.value}</em>`;
+      if (err.message && err.message !== 'Failed to fetch') {
+         displayError = `<em style="color:var(--error);">API Error: ${err.message}</em>`;
+      }
+      aiContentDiv.innerHTML = displayError;
     } finally {
-      sendBtn.disabled = false;
-      userInput.focus();
+      if (isInitialCall) {
+         sendBtn.disabled = false;
+         userInput.focus();
+      }
     }
-  });
+  }
 
   // Background integration for Auto-Context
   chrome.runtime.onMessage.addListener((msg) => {
