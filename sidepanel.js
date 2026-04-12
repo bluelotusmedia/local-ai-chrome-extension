@@ -129,9 +129,9 @@ document.addEventListener('DOMContentLoaded', () => {
          systemPromptInput.value = personas[res.personaSelection];
       }
     } else {
-      // Default to Blue Lotus
-      personaSelect.value = 'blue-lotus';
-      systemPromptInput.value = personas['blue-lotus'];
+      // Default to General Assistant
+      personaSelect.value = 'general';
+      systemPromptInput.value = personas['general'];
     }
     
     // Only overwrite with saved custom prompt if in custom mode
