@@ -44,3 +44,13 @@ chrome.runtime.onMessage.addListener((request, sender, sendResponse) => {
     sendResponse({ title, url, content: contentObj.text, type: contentObj.type });
   }
 });
+
+// Auto-update sidepanel when text is highlighted
+let debounceTimer;
+document.addEventListener('selectionchange', () => {
+    clearTimeout(debounceTimer);
+    debounceTimer = setTimeout(() => {
+        const selection = window.getSelection().toString().trim();
+        chrome.runtime.sendMessage({ action: "contextChanged", hasSelection: selection.length > 0 }).catch(() => {});
+    }, 400);
+});

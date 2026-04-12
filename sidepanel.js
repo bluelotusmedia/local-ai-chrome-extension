@@ -3,7 +3,7 @@ document.addEventListener('DOMContentLoaded', () => {
   const chatForm = document.getElementById('chat-form');
   const userInput = document.getElementById('user-input');
   const sendBtn = document.getElementById('send-btn');
-  const refreshContextBtn = document.getElementById('refresh-context-btn');
+  const newChatBtn = document.getElementById('new-chat-btn');
   const contextPill = document.getElementById('context-pill');
   
   const settingsBtn = document.getElementById('settings-btn');
@@ -13,6 +13,7 @@ document.addEventListener('DOMContentLoaded', () => {
   
   const modelSelect = document.getElementById('model-select');
   const refreshModelsBtn = document.getElementById('refresh-models-btn');
+  const voiceSelect = document.getElementById('voice-select');
   
   const personaSelect = document.getElementById('persona-select');
   const customPromptContainer = document.getElementById('custom-prompt-container');
@@ -42,6 +43,7 @@ document.addEventListener('DOMContentLoaded', () => {
   let isGenerating = false;
   let activeUtterances = [];
   let currentSelectedModel = "local-model";
+  let currentSelectedVoiceURI = "default";
 
   // Speech Recognition Setup
   const SpeechRecognition = window.SpeechRecognition || window.webkitSpeechRecognition;
@@ -127,9 +129,20 @@ document.addEventListener('DOMContentLoaded', () => {
     });
   }
   
+  function applyVoiceToUtterance(utterance) {
+    if (currentSelectedVoiceURI && currentSelectedVoiceURI !== "default") {
+       const voices = speechSynthesis.getVoices();
+       const matchedVoice = voices.find(v => v.voiceURI === currentSelectedVoiceURI);
+       if (matchedVoice) {
+          utterance.voice = matchedVoice;
+       }
+    }
+  }
+
   function speakSentence(text) {
      if (!text) return;
      const utterance = new SpeechSynthesisUtterance(text);
+     applyVoiceToUtterance(utterance);
      activeUtterances.push(utterance);
      
      utterance.onend = () => {
@@ -205,8 +218,43 @@ document.addEventListener('DOMContentLoaded', () => {
       refreshModelsBtn.addEventListener('click', () => fetchAvailableModels(modelSelect.value));
   }
 
+  // Populate Voices
+  function populateVoiceList() {
+    if (typeof speechSynthesis === 'undefined' || !voiceSelect) return;
+    
+    const voices = speechSynthesis.getVoices();
+    if (voices.length === 0) return;
+    
+    const sortedVoices = voices.sort((a, b) => {
+       if (a.lang.startsWith('en') && !b.lang.startsWith('en')) return -1;
+       if (!a.lang.startsWith('en') && b.lang.startsWith('en')) return 1;
+       return a.name.localeCompare(b.name);
+    });
+    
+    const currentVal = voiceSelect.value;
+    voiceSelect.innerHTML = '<option value="default">Default System Voice</option>';
+    
+    sortedVoices.forEach((voice) => {
+      const option = document.createElement('option');
+      option.textContent = `${voice.name} (${voice.lang})`;
+      option.value = voice.voiceURI;
+      voiceSelect.appendChild(option);
+    });
+    
+    if (currentSelectedVoiceURI && currentSelectedVoiceURI !== "default") {
+       voiceSelect.value = currentSelectedVoiceURI;
+    } else if (currentVal !== "default" && Array.from(voiceSelect.options).some(o => o.value === currentVal)) {
+       voiceSelect.value = currentVal;
+    }
+  }
+
+  if (speechSynthesis.onvoiceschanged !== undefined) {
+      speechSynthesis.onvoiceschanged = populateVoiceList;
+  }
+  populateVoiceList();
+
   // Load Settings
-  chrome.storage.local.get(['lmServerUrl', 'systemPrompt', 'personaSelection', 'selectedModel'], (res) => {
+  chrome.storage.local.get(['lmServerUrl', 'systemPrompt', 'personaSelection', 'selectedModel', 'selectedVoiceURI'], (res) => {
     if (res.lmServerUrl) endpointUrlInput.value = res.lmServerUrl;
     
     if (res.personaSelection) {
@@ -231,6 +279,11 @@ document.addEventListener('DOMContentLoaded', () => {
       currentSelectedModel = res.selectedModel;
     }
     fetchAvailableModels(currentSelectedModel);
+
+    if (res.selectedVoiceURI) {
+      currentSelectedVoiceURI = res.selectedVoiceURI;
+      if (voiceSelect) voiceSelect.value = currentSelectedVoiceURI;
+    }
   });
 
   // Quick Actions binding
@@ -249,11 +302,13 @@ document.addEventListener('DOMContentLoaded', () => {
 
   saveSettingsBtn.addEventListener('click', () => {
     currentSelectedModel = modelSelect.value;
+    currentSelectedVoiceURI = voiceSelect ? voiceSelect.value : "default";
     chrome.storage.local.set({
       lmServerUrl: endpointUrlInput.value,
       systemPrompt: systemPromptInput.value,
       personaSelection: personaSelect.value,
-      selectedModel: currentSelectedModel
+      selectedModel: currentSelectedModel,
+      selectedVoiceURI: currentSelectedVoiceURI
     }, () => {
       settingsPanel.classList.add('hidden');
     });
@@ -272,9 +327,15 @@ document.addEventListener('DOMContentLoaded', () => {
     }
   });
 
-  // Refresh Context Action
-  if (refreshContextBtn) {
-    refreshContextBtn.addEventListener('click', () => loadPageContext(true));
+  // New Chat Action
+  if (newChatBtn) {
+    newChatBtn.addEventListener('click', () => {
+       messages = [];
+       if (activeTabUrl) chrome.storage.local.remove([activeTabUrl]);
+       chatHistory.innerHTML = '';
+       appendMessage('system', "Started a new conversation.");
+       updateContextSilently();
+    });
   }
 
   // Initialize
@@ -342,6 +403,24 @@ document.addEventListener('DOMContentLoaded', () => {
     });
   }
 
+  function updateContextSilently() {
+    chrome.tabs.query({ active: true, currentWindow: true }, (tabs) => {
+      if (tabs.length === 0) return;
+      const targetTab = tabs[0];
+      activeTabUrl = targetTab.url;
+      
+      if (!activeTabUrl || activeTabUrl.startsWith('chrome://') || activeTabUrl.startsWith('edge://') || activeTabUrl.startsWith('about:') || activeTabUrl.startsWith('brave://')) {
+        return;
+      }
+      
+      chrome.tabs.sendMessage(targetTab.id, { action: "getPageContent" }, (res) => {
+        if (!chrome.runtime.lastError && res) {
+          handleContextResponse(res);
+        }
+      });
+    });
+  }
+
   function handleContextResponse(response) {
     pageContext = response.content;
     pageTitle = response.title;
@@ -399,6 +478,7 @@ document.addEventListener('DOMContentLoaded', () => {
           window.speechSynthesis.cancel(); // stop any previous
           const textToSpeak = textDiv.innerText;
           const utterance = new SpeechSynthesisUtterance(textToSpeak);
+          applyVoiceToUtterance(utterance);
           utterance.onend = () => {
              isPlaying = false;
              playBtn.classList.remove('playing');
@@ -487,7 +567,10 @@ document.addEventListener('DOMContentLoaded', () => {
     saveChatMemory();
 
     // Prepare system prompt with context
-    const sysPrompt = systemPromptInput.value;
+    let sysPrompt = systemPromptInput.value;
+    if (liveModeEnabled) {
+       sysPrompt += "\n\n[LIVE MODE ACTIVE]: We are currently engaged in a real-time vocal conversation. You MUST keep your responses extremely concise, conversational, and engaging. Speak as if we are on a phone call. Avoid lengthy paragraphs, markdown formatting, or bulleted lists unless explicitly asked for more detail.";
+    }
     const fullSystemMessage = `${sysPrompt}\n\nPAGE CONTEXT:\n${pageContext}`;
 
     // Prepare history payload
@@ -585,4 +668,24 @@ document.addEventListener('DOMContentLoaded', () => {
     }
   });
 
+  // Background integration for Auto-Context
+  chrome.runtime.onMessage.addListener((msg) => {
+     if (msg.action === "contextChanged") {
+        updateContextSilently();
+     }
+  });
+  
+  if (chrome.tabs && chrome.tabs.onUpdated) {
+     chrome.tabs.onUpdated.addListener((tabId, changeInfo, tab) => {
+        if (tab.active && (changeInfo.url || changeInfo.status === 'complete')) {
+           loadPageContext(false);
+        }
+     });
+  }
+  
+  if (chrome.tabs && chrome.tabs.onActivated) {
+     chrome.tabs.onActivated.addListener(() => {
+        loadPageContext(false);
+     });
+  }
 });
