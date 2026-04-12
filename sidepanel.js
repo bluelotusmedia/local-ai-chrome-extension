@@ -16,6 +16,7 @@ document.addEventListener('DOMContentLoaded', () => {
   const systemPromptInput = document.getElementById('system-prompt');
   
   const micBtn = document.getElementById('mic-btn');
+  const liveModeToggleBtn = document.getElementById('live-mode-toggle-btn');
   const quickActionBtns = document.querySelectorAll('.quick-action-btn');
   
   // Initialize marked for code highlighting
@@ -33,6 +34,10 @@ document.addEventListener('DOMContentLoaded', () => {
   let pageTitle = "";
   let messages = [];
   let activeTabUrl = "";
+  
+  let liveModeEnabled = false;
+  let isGenerating = false;
+  let activeUtterances = [];
 
   // Speech Recognition Setup
   const SpeechRecognition = window.SpeechRecognition || window.webkitSpeechRecognition;
@@ -95,10 +100,52 @@ document.addEventListener('DOMContentLoaded', () => {
       } else {
         // stop TTS if trying to talk
         window.speechSynthesis.cancel();
+        activeUtterances = []; // Clear queue tracking
         userInput.value = "";
         recognition.start();
       }
     });
+  }
+
+  if (liveModeToggleBtn) {
+    liveModeToggleBtn.addEventListener('click', () => {
+      liveModeEnabled = !liveModeEnabled;
+      if (liveModeEnabled) {
+         liveModeToggleBtn.classList.add('live-active');
+         liveModeToggleBtn.title = "Toggle Live Mode (ON)";
+      } else {
+         liveModeToggleBtn.classList.remove('live-active');
+         liveModeToggleBtn.title = "Toggle Live Mode (OFF)";
+         window.speechSynthesis.cancel();
+         activeUtterances = [];
+         if (isListening) recognition.stop();
+      }
+    });
+  }
+  
+  function speakSentence(text) {
+     if (!text) return;
+     const utterance = new SpeechSynthesisUtterance(text);
+     activeUtterances.push(utterance);
+     
+     utterance.onend = () => {
+        activeUtterances = activeUtterances.filter(u => u !== utterance);
+        checkAutoListenRestart();
+     };
+     utterance.onerror = () => {
+        activeUtterances = activeUtterances.filter(u => u !== utterance);
+        checkAutoListenRestart();
+     };
+     window.speechSynthesis.speak(utterance);
+  }
+
+  function checkAutoListenRestart() {
+     if (liveModeEnabled && !isGenerating && activeUtterances.length === 0) {
+        if (!isListening && recognition) {
+           // Small delay helps ensure Chrome completes audio hardware release
+           setTimeout(() => recognition.start(), 200); 
+        }
+     }
   }
 
   const personas = {
@@ -375,6 +422,7 @@ document.addEventListener('DOMContentLoaded', () => {
 
     // Stop speaking and listening
     window.speechSynthesis.cancel();
+    activeUtterances = []; // clear utterance queue completely
     if (isListening && recognition) {
        recognition.stop();
        stopListening();
@@ -424,6 +472,9 @@ document.addEventListener('DOMContentLoaded', () => {
       const reader = response.body.getReader();
       const decoder = new TextDecoder("utf-8");
       let botFullText = "";
+      
+      let sentenceBuffer = "";
+      isGenerating = true;
 
       // Stream response
       while (true) {
@@ -438,7 +489,23 @@ document.addEventListener('DOMContentLoaded', () => {
             try {
               const data = JSON.parse(line.substring(6));
               if (data.choices && data.choices[0].delta && data.choices[0].delta.content) {
-                botFullText += data.choices[0].delta.content;
+                const newText = data.choices[0].delta.content;
+                botFullText += newText;
+                
+                if (liveModeEnabled) {
+                  sentenceBuffer += newText;
+                  let match;
+                  // Look for punctuation followed by space or newline
+                  while ((match = sentenceBuffer.match(/([^\.!\?\n]+[\.!\?\n]+)(\s|$)/))) {
+                    const fullMatch = match[0];
+                    const textToSpeak = fullMatch.replace(/[\*`#_]/g, '').trim();
+                    if (textToSpeak) {
+                      speakSentence(textToSpeak);
+                    }
+                    sentenceBuffer = sentenceBuffer.substring(match.index + fullMatch.length);
+                  }
+                }
+                
                 aiContentDiv.innerHTML = formatMarkdown(botFullText) + '<span class="typing-cursor"></span>';
                 scrollToBottom();
               }
@@ -449,13 +516,20 @@ document.addEventListener('DOMContentLoaded', () => {
         }
       }
       
+      if (liveModeEnabled && sentenceBuffer.trim() !== "") {
+         speakSentence(sentenceBuffer.replace(/[\*`#_]/g, '').trim());
+      }
+      
       // Finished
       aiContentDiv.innerHTML = formatMarkdown(botFullText);
       messages.push({ role: "assistant", content: botFullText });
       saveChatMemory();
+      isGenerating = false;
+      checkAutoListenRestart();
 
     } catch (err) {
       console.error(err);
+      isGenerating = false;
       aiContentDiv.innerHTML = `<em>Error: Could not connect to LM Studio. Ensure the local server is running at ${endpointUrlInput.value}</em>`;
     } finally {
       sendBtn.disabled = false;
