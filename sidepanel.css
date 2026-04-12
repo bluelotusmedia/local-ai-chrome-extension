@@ -389,6 +389,49 @@ body {
   border-color: var(--text-muted);
 }
 
+.attachments-container {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 0.4rem;
+  margin-bottom: 0.5rem;
+  padding-left: 0.2rem;
+}
+
+.attachment-pill {
+  display: flex;
+  align-items: center;
+  gap: 0.3rem;
+  font-size: 0.75rem;
+  background-color: var(--bg-surface);
+  border: 1px solid var(--border-color);
+  border-radius: 6px;
+  padding: 0.2rem 0.4rem;
+  color: var(--text-main);
+  max-width: 15rem;
+}
+
+.attachment-pill .filename {
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.attachment-pill .remove-btn {
+  background: none;
+  border: none;
+  color: var(--text-muted);
+  cursor: pointer;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  padding: 0;
+  transition: color 0.1s;
+}
+
+.attachment-pill .remove-btn:hover {
+  color: #ef4444;
+}
+
 #chat-form {
   display: flex;
   align-items: flex-end;

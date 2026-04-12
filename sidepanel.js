@@ -21,7 +21,14 @@ document.addEventListener('DOMContentLoaded', () => {
   
   const micBtn = document.getElementById('mic-btn');
   const liveModeToggleBtn = document.getElementById('live-mode-toggle-btn');
+  const liveMuteToggleBtn = document.getElementById('live-mute-toggle-btn');
   const quickActionBtns = document.querySelectorAll('.quick-action-btn');
+  
+  const attachBtn = document.getElementById('attach-btn');
+  const fileUpload = document.getElementById('file-upload');
+  const attachmentsContainer = document.getElementById('attachments-container');
+  const screenshotBtn = document.getElementById('screenshot-btn');
+  const imageUpload = document.getElementById('image-upload');
   
   // Initialize marked for code highlighting
   if (window.marked && window.hljs) {
@@ -34,16 +41,23 @@ document.addEventListener('DOMContentLoaded', () => {
     });
   }
   
+  // Initialize PDF.js worker
+  if (window.pdfjsLib) {
+     window.pdfjsLib.GlobalWorkerOptions.workerSrc = 'pdf.worker.min.js';
+  }
+  
   let pageContext = "";
   let pageTitle = "";
   let messages = [];
   let activeTabUrl = "";
   
   let liveModeEnabled = false;
+  let liveMuted = false;
   let isGenerating = false;
   let activeUtterances = [];
   let currentSelectedModel = "local-model";
   let currentSelectedVoiceURI = "default";
+  let pendingAttachments = [];
 
   // Speech Recognition Setup
   const SpeechRecognition = window.SpeechRecognition || window.webkitSpeechRecognition;
@@ -119,14 +133,147 @@ document.addEventListener('DOMContentLoaded', () => {
       if (liveModeEnabled) {
          liveModeToggleBtn.classList.add('live-active');
          liveModeToggleBtn.title = "Toggle Live Mode (ON)";
+         if (liveMuteToggleBtn) liveMuteToggleBtn.style.display = 'inline-flex';
       } else {
          liveModeToggleBtn.classList.remove('live-active');
          liveModeToggleBtn.title = "Toggle Live Mode (OFF)";
          window.speechSynthesis.cancel();
          activeUtterances = [];
          if (isListening) recognition.stop();
+         
+         if (liveMuteToggleBtn) liveMuteToggleBtn.style.display = 'none';
+         liveMuted = false;
+         updateMuteIcon();
       }
     });
+  }
+  
+  if (liveMuteToggleBtn) {
+    liveMuteToggleBtn.addEventListener('click', () => {
+       liveMuted = !liveMuted;
+       updateMuteIcon();
+    });
+  }
+
+  function updateMuteIcon() {
+     if (!liveMuteToggleBtn) return;
+     const unmutedIcon = liveMuteToggleBtn.querySelector('.icon-unmuted');
+     const mutedIcon = liveMuteToggleBtn.querySelector('.icon-muted');
+     if (liveMuted) {
+        unmutedIcon.style.display = 'none';
+        mutedIcon.style.display = 'block';
+        window.speechSynthesis.cancel();
+     } else {
+        unmutedIcon.style.display = 'block';
+        mutedIcon.style.display = 'none';
+     }
+  }
+  
+  // File Attachment Logic
+  function handleFileSelect(e) {
+     const files = Array.from(e.target.files);
+     files.forEach(file => {
+        // Skip if already attached
+        if (pendingAttachments.some(a => a.name === file.name)) return;
+        
+        const isImage = file.type.startsWith('image/');
+        const isPdf = file.name.toLowerCase().endsWith('.pdf');
+        
+        const reader = new FileReader();
+        
+        if (isPdf && window.pdfjsLib) {
+           reader.onload = (event) => {
+              const typedarray = new Uint8Array(event.target.result);
+              window.pdfjsLib.getDocument(typedarray).promise.then(pdf => {
+                 let textPromises = [];
+                 for (let i = 1; i <= pdf.numPages; i++) {
+                    textPromises.push(pdf.getPage(i).then(page => {
+                       return page.getTextContent().then(textContent => {
+                          return textContent.items.map(item => item.str).join(' ');
+                       });
+                    }));
+                 }
+                 Promise.all(textPromises).then(pagesText => {
+                    pendingAttachments.push({
+                       name: file.name,
+                       content: pagesText.join('\n\n'),
+                       isImage: false,
+                       isPdf: true
+                    });
+                    renderAttachments();
+                 });
+              }).catch(err => {
+                  console.error('Error parsing PDF:', err);
+                  alert(`Failed to parse PDF: ${file.name}`);
+              });
+           };
+           reader.readAsArrayBuffer(file);
+        } else {
+           reader.onload = (event) => {
+              pendingAttachments.push({
+                 name: file.name,
+                 content: event.target.result,
+                 isImage: isImage
+              });
+              renderAttachments();
+           };
+           
+           if (isImage) {
+              reader.readAsDataURL(file);
+           } else {
+              reader.readAsText(file);
+           }
+        }
+     });
+     e.target.value = ''; // Reset input to allow attaching same file again if removed
+  }
+
+  if (attachBtn && fileUpload) {
+     attachBtn.addEventListener('click', () => {
+        fileUpload.click();
+     });
+     fileUpload.addEventListener('change', handleFileSelect);
+  }
+  
+  // Image Upload Logic (Repurposed Screenshot Button)
+  if (screenshotBtn && imageUpload) {
+     screenshotBtn.addEventListener('click', () => {
+        imageUpload.click();
+     });
+     imageUpload.addEventListener('change', handleFileSelect);
+  }
+  
+  function renderAttachments() {
+     if (!attachmentsContainer) return;
+     attachmentsContainer.innerHTML = '';
+     
+     pendingAttachments.forEach((att, index) => {
+        const pill = document.createElement('div');
+        pill.className = 'attachment-pill';
+        
+        const iconSpan = document.createElement('span');
+        if (att.isImage) iconSpan.textContent = '🖼️';
+        else if (att.isPdf) iconSpan.textContent = '📕';
+        else iconSpan.textContent = '📄';
+        
+        const nameSpan = document.createElement('span');
+        nameSpan.className = 'filename';
+        nameSpan.textContent = att.name;
+        
+        const removeBtn = document.createElement('button');
+        removeBtn.className = 'remove-btn';
+        removeBtn.title = 'Remove Attachment';
+        removeBtn.innerHTML = '<svg xmlns="http://www.w3.org/2000/svg" width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><line x1="18" y1="6" x2="6" y2="18"></line><line x1="6" y1="6" x2="18" y2="18"></line></svg>';
+        removeBtn.addEventListener('click', () => {
+           pendingAttachments.splice(index, 1);
+           renderAttachments();
+        });
+        
+        pill.appendChild(iconSpan);
+        pill.appendChild(nameSpan);
+        pill.appendChild(removeBtn);
+        attachmentsContainer.appendChild(pill);
+     });
   }
   
   function applyVoiceToUtterance(utterance) {
@@ -170,7 +317,7 @@ document.addEventListener('DOMContentLoaded', () => {
     "reviewer": "You are a strict, senior code reviewer. You analyze code for security, performance, readability, and best practices. Point out every flaw, suggest optimizations, and provide corrected code examples. Be direct and concise. Ensure the context provided by the user is used efficiently.",
     "copywriter": "You are an expert SEO copywriter and marketer. Your goal is to rewrite or generate text that drives conversions, captures attention, and ranks high on search engines. Use persuasive language, strong hooks, and clear calls to action based on the context provided.",
     "financial": "You are a specialized Financial, Trading, and Tax Assistant. You help users analyze financial texts, digest stock market news, explain algorithmic trading strategies, and summarize tax documents. You provide clear, data-driven, and objective explanations. CRITICAL RULE: You must always append a brief disclaimer to your responses explicitly stating that you are an AI, this information is for educational purposes only, and it does not constitute verified financial, legal, or tax advice.",
-    "general": "You are a helpful AI assistant. You are given the content of a webpage. Answer the user's questions based on this webpage's content."
+    "general": "You are a helpful AI assistant. You are given the content of a webpage. Answer the user's questions based on this webpage's content. One-liner responses only unless asked for more detail."
   };
 
   personaSelect.addEventListener('change', (e) => {
@@ -300,6 +447,14 @@ document.addEventListener('DOMContentLoaded', () => {
     settingsPanel.classList.toggle('hidden');
   });
 
+  // Mic Settings Redirect
+  const micSettingsBtn = document.getElementById('mic-settings-link');
+  if (micSettingsBtn) {
+     micSettingsBtn.addEventListener('click', () => {
+        chrome.tabs.create({ url: 'chrome://settings/content/microphone' });
+     });
+  }
+
   saveSettingsBtn.addEventListener('click', () => {
     currentSelectedModel = modelSelect.value;
     currentSelectedVoiceURI = voiceSelect ? voiceSelect.value : "default";
@@ -373,7 +528,15 @@ document.addEventListener('DOMContentLoaded', () => {
         if (messages.length === 0) {
            appendMessage('system', "Context loaded. Starting a new conversation about the current page.");
         } else {
-           messages.forEach(msg => appendMessage(msg.role, msg.content));
+           messages.forEach(msg => {
+              if (msg.uiContent) {
+                  appendMessage(msg.role, msg.uiContent);
+              } else if (Array.isArray(msg.content)) {
+                  appendMessage(msg.role, "[Vision Payload]");
+              } else {
+                  appendMessage(msg.role, msg.content);
+              }
+           });
         }
       });
       
@@ -562,8 +725,39 @@ document.addEventListener('DOMContentLoaded', () => {
     sendBtn.disabled = true;
 
     // Add user msg to UI
-    appendMessage('user', text);
-    messages.push({ role: "user", content: text });
+    let finalPayloadContent = null;
+    let hasImages = pendingAttachments.some(a => a.isImage);
+
+    let uiUserText = text;
+    let combinedTextPayload = text;
+    
+    if (pendingAttachments.length > 0) {
+       uiUserText += '\n\n*Attachments: ' + pendingAttachments.map(a => a.name).join(', ') + '*';
+       
+       pendingAttachments.filter(a => !a.isImage).forEach(att => {
+          combinedTextPayload += `\n\n[USER ATTACHED FILE - '${att.name}']:\n\`\`\`\n${att.content}\n\`\`\``;
+       });
+
+       if (hasImages) {
+          finalPayloadContent = [{ type: "text", text: combinedTextPayload }];
+          pendingAttachments.filter(a => a.isImage).forEach(att => {
+             finalPayloadContent.push({
+                type: "image_url",
+                image_url: { url: att.content }
+             });
+          });
+       } else {
+          finalPayloadContent = combinedTextPayload;
+       }
+
+       pendingAttachments = [];
+       renderAttachments();
+    } else {
+       finalPayloadContent = text;
+    }
+
+    appendMessage('user', uiUserText);
+    messages.push({ role: "user", content: finalPayloadContent, uiContent: uiUserText });
     saveChatMemory();
 
     // Prepare system prompt with context
@@ -573,10 +767,11 @@ document.addEventListener('DOMContentLoaded', () => {
     }
     const fullSystemMessage = `${sysPrompt}\n\nPAGE CONTEXT:\n${pageContext}`;
 
-    // Prepare history payload
+    // Prepare history payload mapping out UI-only fields to avoid schema errors
+    const cleanedMessages = messages.map(m => ({ role: m.role, content: m.content }));
     const payloadMessages = [
       { role: "system", content: fullSystemMessage },
-      ...messages
+      ...cleanedMessages
     ];
 
     const aiContentDiv = appendMessage('ai', '');
@@ -623,7 +818,7 @@ document.addEventListener('DOMContentLoaded', () => {
                 const newText = data.choices[0].delta.content;
                 botFullText += newText;
                 
-                if (liveModeEnabled) {
+                if (liveModeEnabled && !liveMuted) {
                   sentenceBuffer += newText;
                   let match;
                   // Look for punctuation followed by space or newline
@@ -647,7 +842,7 @@ document.addEventListener('DOMContentLoaded', () => {
         }
       }
       
-      if (liveModeEnabled && sentenceBuffer.trim() !== "") {
+      if (liveModeEnabled && !liveMuted && sentenceBuffer.trim() !== "") {
          speakSentence(sentenceBuffer.replace(/[\*`#_]/g, '').trim());
       }
       
