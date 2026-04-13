@@ -41,12 +41,19 @@ document.addEventListener('DOMContentLoaded', () => {
       langPrefix: 'hljs language-'
     });
   }
-  
-  // Initialize PDF.js worker
+
+  // Initialize PDF.js Worker
   if (window.pdfjsLib) {
-     window.pdfjsLib.GlobalWorkerOptions.workerSrc = 'pdf.worker.min.js';
+    pdfjsLib.GlobalWorkerOptions.workerSrc = chrome.runtime.getURL('pdf.worker.min.js');
   }
   
+  // Auto-grow textarea
+  userInput.addEventListener('input', () => {
+     userInput.style.height = 'auto';
+     userInput.style.height = (userInput.scrollHeight) + 'px';
+  });
+
+  // Global Context State
   let pageContext = "";
   let pageTitle = "";
   let messages = [];
@@ -80,14 +87,37 @@ document.addEventListener('DOMContentLoaded', () => {
     recognition.onresult = (event) => {
       let finalTranscript = '';
       let interimTranscript = '';
+      
+      const PHANTOM_PHRASES = ['ok google', 'lets play', 'can you play', 'snooze for 15 mins', 'set a timer'];
+
       for (let i = event.resultIndex; i < event.results.length; ++i) {
+        const result = event.results[i][0];
+        const transcript = result.transcript.trim().toLowerCase();
+        const confidence = result.confidence;
+
+        // Filter out obvious low-confidence phantom results
         if (event.results[i].isFinal) {
-          finalTranscript += event.results[i][0].transcript;
+          if (confidence < 0.1) continue; // Extremely low confidence is likely noise
+          
+          // If it's a short result and matches known hallucinations, ignore it
+          if (confidence < 0.6 && PHANTOM_PHRASES.some(p => transcript.includes(p))) {
+            console.warn("Rejected phantom speech result:", transcript, "confidence:", confidence);
+            continue;
+          }
+          
+          finalTranscript += result.transcript;
         } else {
-          interimTranscript += event.results[i][0].transcript;
+          // For interim results, we only show them if they look reasonably confident or if we have at least some length
+          if (confidence > 0.05) {
+            interimTranscript += result.transcript;
+          }
         }
       }
-      userInput.value = finalTranscript || interimTranscript;
+      
+      const combined = finalTranscript || interimTranscript;
+      if (combined.trim()) {
+        userInput.value = combined;
+      }
     };
     
     recognition.onerror = (event) => {
@@ -174,64 +204,124 @@ document.addEventListener('DOMContentLoaded', () => {
      }
   }
   
-  // File Attachment Logic
+   async function extractTextFromPdfBytes(data) {
+      if (!window.pdfjsLib) throw new Error("PDF.js library not loaded.");
+      const typedarray = new Uint8Array(data);
+      const pdf = await window.pdfjsLib.getDocument(typedarray).promise;
+      
+      let fullText = "";
+      // 35,000 chars is roughly 8k-10k tokens. 
+      // This is a sweet spot for local inference speed vs context retention.
+      const MAX_TOTAL_CHARS = 35000; 
+      let wasTruncated = false;
+
+      // Process pages sequentially to allow early exit on limit reached
+      for (let i = 1; i <= pdf.numPages; i++) {
+         const page = await pdf.getPage(i);
+         const textContent = await page.getTextContent();
+         
+         let lastY = -1;
+         let pageText = "";
+         
+         // Sort items by vertical position (Y) and then horizontal position (X)
+         // transform[5] is Y, transform[4] is X
+         const sortedItems = [...textContent.items].sort((a, b) => {
+            if (Math.abs(a.transform[5] - b.transform[5]) > 2) {
+               return b.transform[5] - a.transform[5]; // Top to bottom
+            }
+            return a.transform[4] - b.transform[4]; // Left to right
+         });
+
+         for (const item of sortedItems) {
+            const currentY = item.transform[5];
+            
+            // Insert newline if vertical position changes significantly
+            if (lastY !== -1 && Math.abs(currentY - lastY) > 5) {
+               pageText += "\n";
+            }
+            pageText += item.str + " ";
+            lastY = currentY;
+         }
+
+         fullText += pageText.trim() + "\n\n";
+
+         if (fullText.length > MAX_TOTAL_CHARS) {
+            fullText = fullText.substring(0, MAX_TOTAL_CHARS);
+            wasTruncated = true;
+            break;
+         }
+      }
+
+      return { text: fullText.trim(), truncated: wasTruncated };
+   }
+
+   // File Attachment Logic
+   function processFile(file) {
+      // Skip if already attached
+      if (pendingAttachments.some(a => a.name === file.name)) return;
+      
+      const isImage = file.type.startsWith('image/');
+      const isPdf = file.name.toLowerCase().endsWith('.pdf');
+      
+      if (isPdf && window.pdfjsLib) {
+         const reader = new FileReader();
+         reader.onload = async (event) => {
+            try {
+               const result = await extractTextFromPdfBytes(event.target.result);
+               pendingAttachments.push({
+                  name: file.name,
+                  content: result.text,
+                  isImage: false,
+                  isPdf: true,
+                  enabled: true,
+                  truncated: result.truncated
+               });
+               renderAttachments();
+            } catch (err) {
+               console.error('Error parsing PDF:', err);
+               alert(`Failed to parse PDF: ${file.name}`);
+            }
+         };
+         reader.readAsArrayBuffer(file);
+      } else {
+         const reader = new FileReader();
+         reader.onload = (event) => {
+            pendingAttachments.push({
+               name: file.name,
+               content: event.target.result,
+               isImage: isImage,
+               enabled: true
+            });
+            renderAttachments();
+         };
+         
+         if (isImage) {
+            reader.readAsDataURL(file);
+         } else {
+            reader.readAsText(file);
+         }
+      }
+   }
+
   function handleFileSelect(e) {
      const files = Array.from(e.target.files);
-     files.forEach(file => {
-        // Skip if already attached
-        if (pendingAttachments.some(a => a.name === file.name)) return;
-        
-        const isImage = file.type.startsWith('image/');
-        const isPdf = file.name.toLowerCase().endsWith('.pdf');
-        
-        const reader = new FileReader();
-        
-        if (isPdf && window.pdfjsLib) {
-           reader.onload = (event) => {
-              const typedarray = new Uint8Array(event.target.result);
-              window.pdfjsLib.getDocument(typedarray).promise.then(pdf => {
-                 let textPromises = [];
-                 for (let i = 1; i <= pdf.numPages; i++) {
-                    textPromises.push(pdf.getPage(i).then(page => {
-                       return page.getTextContent().then(textContent => {
-                          return textContent.items.map(item => item.str).join(' ');
-                       });
-                    }));
-                 }
-                 Promise.all(textPromises).then(pagesText => {
-                    pendingAttachments.push({
-                       name: file.name,
-                       content: pagesText.join('\n\n'),
-                       isImage: false,
-                       isPdf: true
-                    });
-                    renderAttachments();
-                 });
-              }).catch(err => {
-                  console.error('Error parsing PDF:', err);
-                  alert(`Failed to parse PDF: ${file.name}`);
-              });
-           };
-           reader.readAsArrayBuffer(file);
-        } else {
-           reader.onload = (event) => {
-              pendingAttachments.push({
-                 name: file.name,
-                 content: event.target.result,
-                 isImage: isImage
-              });
-              renderAttachments();
-           };
-           
-           if (isImage) {
-              reader.readAsDataURL(file);
-           } else {
-              reader.readAsText(file);
-           }
-        }
-     });
+     files.forEach(processFile);
      e.target.value = ''; // Reset input to allow attaching same file again if removed
   }
+
+  document.addEventListener('paste', (e) => {
+     const items = (e.clipboardData || e.originalEvent.clipboardData).items;
+     for (let i = 0; i < items.length; i++) {
+        if (items[i].type.indexOf('image') !== -1) {
+           const blob = items[i].getAsFile();
+           if (blob) {
+              const timestamp = new Date().toLocaleTimeString([], { hour: '2-digit', minute: '2-digit', second: '2-digit' }).replace(/:/g, '-');
+              const file = new File([blob], `pasted_image_${timestamp}.png`, { type: blob.type });
+              processFile(file);
+           }
+        }
+     }
+  });
 
   if (attachBtn && fileUpload) {
      attachBtn.addEventListener('click', () => {
@@ -248,14 +338,36 @@ document.addEventListener('DOMContentLoaded', () => {
      imageUpload.addEventListener('change', handleFileSelect);
   }
   
-  function renderAttachments() {
+   function renderAttachments() {
      if (!attachmentsContainer) return;
      attachmentsContainer.innerHTML = '';
      
+     if (pendingAttachments.length > 0) {
+        const header = document.createElement('div');
+        header.style.fontSize = '0.7rem';
+        header.style.color = 'var(--text-muted)';
+        header.style.fontWeight = '600';
+        header.style.textTransform = 'uppercase';
+        header.style.letterSpacing = '0.05em';
+        header.style.marginBottom = '0.4rem';
+        header.style.paddingLeft = '0.2rem';
+        header.textContent = 'Active Context Sources';
+        attachmentsContainer.appendChild(header);
+     }
+
      pendingAttachments.forEach((att, index) => {
         const pill = document.createElement('div');
-        pill.className = 'attachment-pill';
+        pill.className = `source-pill ${!att.enabled ? 'disabled' : ''}`;
         
+        const checkbox = document.createElement('input');
+        checkbox.type = 'checkbox';
+        checkbox.className = 'source-checkbox';
+        checkbox.checked = att.enabled;
+        checkbox.addEventListener('change', () => {
+           att.enabled = checkbox.checked;
+           renderAttachments();
+        });
+
         const iconSpan = document.createElement('span');
         if (att.isImage) iconSpan.textContent = '🖼️';
         else if (att.isPdf) iconSpan.textContent = '📕';
@@ -264,16 +376,23 @@ document.addEventListener('DOMContentLoaded', () => {
         const nameSpan = document.createElement('span');
         nameSpan.className = 'filename';
         nameSpan.textContent = att.name;
+        nameSpan.title = att.name;
+        nameSpan.addEventListener('click', () => {
+           checkbox.checked = !checkbox.checked;
+           checkbox.dispatchEvent(new Event('change'));
+        });
         
         const removeBtn = document.createElement('button');
         removeBtn.className = 'remove-btn';
-        removeBtn.title = 'Remove Attachment';
+        removeBtn.title = 'Remove Source';
         removeBtn.innerHTML = '<svg xmlns="http://www.w3.org/2000/svg" width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><line x1="18" y1="6" x2="6" y2="18"></line><line x1="6" y1="6" x2="18" y2="18"></line></svg>';
-        removeBtn.addEventListener('click', () => {
+        removeBtn.addEventListener('click', (e) => {
+           e.stopPropagation();
            pendingAttachments.splice(index, 1);
            renderAttachments();
         });
         
+        pill.appendChild(checkbox);
         pill.appendChild(iconSpan);
         pill.appendChild(nameSpan);
         pill.appendChild(removeBtn);
@@ -293,7 +412,15 @@ document.addEventListener('DOMContentLoaded', () => {
 
   function speakSentence(text) {
      if (!text) return;
-     const utterance = new SpeechSynthesisUtterance(text);
+     // Centralized stripping of markdown and emojis before TTS
+     let cleanedText = text
+           .replace(/([-=_~*]){2,}/g, ' ') // Remove repetitive separators (---, ===, etc)
+           .replace(/[\*`#_]/g, '')        // Remove remaining markdown symbols
+           .replace(/[\p{Emoji_Presentation}\p{Extended_Pictographic}\uFE0F\u200D]/gu, '')
+           .trim();
+           
+     if (!cleanedText) return;
+     const utterance = new SpeechSynthesisUtterance(cleanedText);
      applyVoiceToUtterance(utterance);
      activeUtterances.push(utterance);
      
@@ -317,12 +444,34 @@ document.addEventListener('DOMContentLoaded', () => {
      }
   }
 
+  const chartInstruct = `
+---
+CHART GENERATION CAPABILITY:
+You can render visual charts by outputting a JSON object wrapped EXACTLY in \`\`\`chart ... \`\`\`.
+CRITICAL RULES FOR CHARTS:
+1. You MUST include the opening { and closing } for the JSON.
+2. Valid types: "line", "bar", "pie", "percentage", "heatmap".
+3. Do not include any other text inside the backticks.
+
+Example:
+\`\`\`chart
+{
+  "title": "My Chart",
+  "type": "bar",
+  "data": {
+    "labels": ["A", "B"],
+    "datasets": [{ "values": [10, 20] }]
+  }
+}
+\`\`\`
+---`;
+
   const personas = {
-    "blue-lotus": "You’re Blue Lotus AI, the creative mastermind behind Blue Lotus Media. Your mission: help clients turn bold ideas into pixel-perfect, user-loving digital experiences. You’re fluent in web dev, graphic design, UI/UX, branding, marketing, e-commerce, SEO, and social media. You speak in a friendly yet professional tone, sprinkle industry jargon when it matters, but always keep explanations clear and actionable. You’re ready to draft copy, brainstorm concepts, debug code snippets, or design a brand identity—all while staying true to the brand’s mission of ‘empowering businesses and artists with cutting-edge creative content that captures the essence of their brand identity.",
-    "reviewer": "You are a strict, senior code reviewer. You analyze code for security, performance, readability, and best practices. Point out every flaw, suggest optimizations, and provide corrected code examples. Be direct and concise. Ensure the context provided by the user is used efficiently.",
-    "copywriter": "You are an expert SEO copywriter and marketer. Your goal is to rewrite or generate text that drives conversions, captures attention, and ranks high on search engines. Use persuasive language, strong hooks, and clear calls to action based on the context provided.",
-    "financial": "You are a specialized Financial, Trading, and Tax Assistant. You help users analyze financial texts, digest stock market news, explain algorithmic trading strategies, and summarize tax documents. You provide clear, data-driven, and objective explanations. CRITICAL RULE: You must always append a brief disclaimer to your responses explicitly stating that you are an AI, this information is for educational purposes only, and it does not constitute verified financial, legal, or tax advice.",
-    "general": "You are a helpful AI assistant. You are given the content of a webpage. Answer the user's questions based on this webpage's content. One-liner responses only unless asked for more detail."
+    "blue-lotus": "You’re Blue Lotus AI, the creative mastermind behind Blue Lotus Media. Your mission: help clients turn bold ideas into pixel-perfect, user-loving digital experiences. You’re fluent in web dev, graphic design, UI/UX, branding, marketing, e-commerce, SEO, and social media. You speak in a friendly yet professional tone, sprinkle industry jargon when it matters, but always keep explanations clear and actionable." + chartInstruct,
+    "reviewer": "You are a strict, senior code reviewer. You analyze code for security, performance, readability, and best practices. Point out every flaw, suggest optimizations, and provide corrected code examples. Be direct and concise." + chartInstruct,
+    "copywriter": "You are an expert SEO copywriter and marketer. Your goal is to rewrite or generate text that drives conversions, captures attention, and ranks high on search engines. Use persuasive language, strong hooks, and clear calls to action." + chartInstruct,
+    "financial": "You are a specialized Financial, Trading, and Tax Assistant. You help users analyze financial texts, digest stock market news, explain algorithmic trading strategies, and summarize tax documents. CRITICAL RULE: You must always append a brief disclaimer stating this is for educational purposes only." + chartInstruct,
+    "general": "You are a helpful AI assistant. Answer the user's questions based on the page context. One-liner responses only unless asked for more detail." + chartInstruct
   };
 
   personaSelect.addEventListener('change', (e) => {
@@ -506,77 +655,123 @@ document.addEventListener('DOMContentLoaded', () => {
   }
 
   // Initialize
-  loadPageContext(false);
-
   function loadPageContext(clearChat = false) {
-    contextPill.innerText = "Loading context...";
-    contextPill.classList.remove('error');
-    
-    // Get active tab and send message to content script
-    chrome.tabs.query({ active: true, currentWindow: true }, (tabs) => {
-      if (tabs.length === 0) {
-        setContextError("No active tab.");
-        return;
-      }
-      
-      const targetTab = tabs[0];
-      activeTabUrl = targetTab.url;
-      
-      if (!activeTabUrl || activeTabUrl.startsWith('chrome://') || activeTabUrl.startsWith('edge://') || activeTabUrl.startsWith('about:') || activeTabUrl.startsWith('brave://')) {
-        setContextError("Cannot read browser pages.");
-        return;
-      }
-      
-      // Load History for this URL
-      chrome.storage.local.get([activeTabUrl], (res) => {
-        if (clearChat) {
-          messages = [];
-          chrome.storage.local.remove([activeTabUrl]);
-        } else {
-          messages = res[activeTabUrl] || [];
-        }
-        
-        chatHistory.innerHTML = '';
-        if (messages.length === 0) {
-           appendMessage('system', "Context loaded. Starting a new conversation about the current page.");
-        } else {
-           messages.forEach(msg => {
-              if (msg.uiContent) {
-                  appendMessage(msg.role, msg.uiContent);
-              } else if (Array.isArray(msg.content)) {
-                  appendMessage(msg.role, "[Vision Payload]");
-              } else {
-                  appendMessage(msg.role, msg.content);
-              }
+     contextPill.innerText = "Loading context...";
+     contextPill.classList.remove('error');
+     
+     // Get active tab and send message to content script
+     chrome.tabs.query({ active: true, currentWindow: true }, (tabs) => {
+       if (tabs.length === 0) {
+         setContextError("No active tab.");
+         return;
+       }
+       
+       const targetTab = tabs[0];
+       activeTabUrl = targetTab.url;
+       pageTitle = targetTab.title || "Unknown Page";
+       
+       if (!activeTabUrl || activeTabUrl.startsWith('chrome://') || activeTabUrl.startsWith('edge://') || activeTabUrl.startsWith('about:') || activeTabUrl.startsWith('brave://')) {
+         setContextError("Cannot read browser pages.");
+         return;
+       }
+
+       // Browser PDF Detection
+       const isPdfUrl = (url) => {
+         try {
+           const urlObj = new URL(url);
+           // Check pathname, search, and hash for .pdf
+           return /\.pdf($|\?|#)/i.test(urlObj.pathname);
+         } catch(e) { return false; }
+       };
+
+       if (isPdfUrl(activeTabUrl)) {
+          processPdfTab(activeTabUrl);
+          // Still load history though
+          loadHistoryForUrl(activeTabUrl, clearChat);
+          return;
+       }
+       
+       // Load History for this URL
+       loadHistoryForUrl(activeTabUrl, clearChat);
+       
+       // Try sending message first as content scripts may already be running
+       chrome.tabs.sendMessage(targetTab.id, { action: "getPageContent" }, (response) => {
+         if (!chrome.runtime.lastError && response) {
+           handleContextResponse(response);
+         } else {
+           // Attempt to execute the content script first just in case it hasn't run
+           chrome.scripting.executeScript({
+             target: { tabId: targetTab.id },
+             files: ['content.js']
+           }).then(() => {
+             chrome.tabs.sendMessage(targetTab.id, { action: "getPageContent" }, (response2) => {
+               if (chrome.runtime.lastError || !response2) {
+                 setContextError("Could not read page.");
+                 return;
+               }
+               handleContextResponse(response2);
+             });
+           }).catch(err => {
+             setContextError("Cannot run on this page.");
+             console.error(err);
            });
-        }
-      });
-      
-      // Try sending message first as content scripts may already be running
-      chrome.tabs.sendMessage(targetTab.id, { action: "getPageContent" }, (response) => {
-        if (!chrome.runtime.lastError && response) {
-          handleContextResponse(response);
-        } else {
-          // Attempt to execute the content script first just in case it hasn't run
-          chrome.scripting.executeScript({
-            target: { tabId: targetTab.id },
-            files: ['content.js']
-          }).then(() => {
-            chrome.tabs.sendMessage(targetTab.id, { action: "getPageContent" }, (response2) => {
-              if (chrome.runtime.lastError || !response2) {
-                setContextError("Could not read page.");
-                return;
-              }
-              handleContextResponse(response2);
+         }
+       });
+     });
+   }
+
+   async function processPdfTab(url) {
+      contextPill.innerText = "Extracting PDF context...";
+      try {
+         const response = await fetch(url);
+         if (!response.ok) throw new Error("Failed to fetch PDF");
+         const data = await response.arrayBuffer();
+         const result = await extractTextFromPdfBytes(data);
+         
+         // Verify we are still on the same tab before applying context
+         chrome.tabs.query({ active: true, currentWindow: true }, (tabs) => {
+           if (tabs.length > 0 && tabs[0].url === url) {
+             handleContextResponse({ title: pageTitle || "PDF Document", url, content: result.text, type: "pdf-tab", truncated: result.truncated });
+           } else {
+             console.log("PDF extraction finished but tab was changed. Ignoring.");
+           }
+         });
+      } catch (err) {
+         console.error("PDF Tab Error:", err);
+         if (url.startsWith('file://')) {
+            setContextError("Cannot read local PDF. Please use 'Attach Document'.");
+         } else {
+            setContextError("CORS or network error reading PDF. Try attaching it manually.");
+         }
+      }
+   }
+
+   function loadHistoryForUrl(url, clearChat) {
+      chrome.storage.local.get([url], (res) => {
+         if (clearChat) {
+           messages = [];
+           chrome.storage.local.remove([url]);
+         } else {
+           messages = res[url] || [];
+         }
+         
+         chatHistory.innerHTML = '';
+         if (messages.length === 0) {
+            appendMessage('system', "Context loaded. Starting a new conversation about the current page.");
+         } else {
+            messages.forEach(msg => {
+               if (msg.uiContent) {
+                   appendMessage(msg.role, msg.uiContent);
+               } else if (Array.isArray(msg.content)) {
+                   appendMessage(msg.role, "[Vision Payload]");
+               } else {
+                   appendMessage(msg.role, msg.content);
+               }
             });
-          }).catch(err => {
-            setContextError("Cannot run on this page.");
-            console.error(err);
-          });
-        }
+         }
+         scrollToBottom();
       });
-    });
-  }
+   }
 
   function updateContextSilently() {
     chrome.tabs.query({ active: true, currentWindow: true }, (tabs) => {
@@ -596,21 +791,69 @@ document.addEventListener('DOMContentLoaded', () => {
     });
   }
 
-  function handleContextResponse(response) {
-    pageContext = response.content;
-    pageTitle = response.title;
-    if (response.type === 'selection') {
-       contextPill.innerText = `Context: Highlighted Text`;
-    } else {
-       contextPill.innerText = `Context: ${pageTitle.substring(0, 20)}...`;
-    }
-    contextPill.classList.remove('error');
-  }
+   function handleContextResponse(response) {
+     pageContext = response.content;
+     pageTitle = response.title;
+     
+     let statusText = `Context: ${pageTitle.substring(0, 20)}...`;
+     if (response.type === 'selection') {
+        statusText = `Context: Highlighted Text`;
+     }
+     if (response.truncated) {
+        statusText += " (Truncated)";
+     }
+     
+     contextPill.innerText = statusText;
+     contextPill.classList.remove('error');
+   }
 
   function saveChatMemory() {
-    if (activeTabUrl) {
-      chrome.storage.local.set({ [activeTabUrl]: messages });
+    chrome.storage.local.set({ 
+      "global_chat_messages": messages,
+      "last_settings": {
+        model: currentSelectedModel,
+        persona: personaSelect.value,
+        webAccess: webAccessToggle.checked,
+        voice: voiceSelect.value
+      }
+    });
+  }
+
+  async function loadChatMemory() {
+    const data = await chrome.storage.local.get(["global_chat_messages", "last_settings"]);
+    
+    if (data.last_settings) {
+       const s = data.last_settings;
+       if (s.persona) {
+          personaSelect.value = s.persona;
+          if (s.persona === 'custom') customPromptContainer.style.display = 'block';
+          systemPromptInput.value = personas[s.persona] || s.persona;
+       }
+       webAccessToggle.checked = !!s.webAccess;
+       webAccessEnabled = !!s.webAccess;
     }
+
+    if (data.global_chat_messages && Array.isArray(data.global_chat_messages)) {
+      messages = data.global_chat_messages;
+      chatHistory.innerHTML = ""; // Clear initial greeting if we have history
+      messages.forEach(msg => {
+        const role = msg.role === 'assistant' ? 'ai' : msg.role;
+        const div = appendMessage(role, msg.uiContent || msg.content);
+        // Ensure buttons and charts are re-rendered if applicable
+        renderChartsInElement(div); 
+      });
+      scrollToBottom();
+    }
+  }
+
+  function clearChatMemory() {
+    chrome.storage.local.remove(["global_chat_messages"]);
+    messages = [];
+    chatHistory.innerHTML = `
+      <div class="message system-msg">
+        <div class="message-content">Chat history cleared. Start a new conversation!</div>
+      </div>
+    `;
   }
 
   function setContextError(msg) {
@@ -723,20 +966,70 @@ document.addEventListener('DOMContentLoaded', () => {
     chatHistory.scrollTop = chatHistory.scrollHeight;
   }
 
+  // Fix mangled chart blocks common with smaller 3B-7B models
+  function preprocessMangledCharts(text) {
+     let out = text;
+     
+     // Case 1: Model used ```json instead of ```chart
+     out = out.replace(/```(?:json)?\s*\{\s*"type":\s*"(bar|line|pie|percentage|heatmap)"/g, '```chart\n{\n  "type": "$1"');
+     
+     // Case 2: Model completely forgot the opening ```chart and {
+     if (!out.includes('```chart') && out.match(/"type":\s*"(bar|line|pie|percentage|heatmap)"/) && out.match(/\}\s*```/)) {
+         out = out.replace(/(?:^|\s*)"type":\s*"(bar|line|pie|percentage|heatmap)"/, '\n```chart\n{\n  "type": "$1"');
+     }
+     
+     return out;
+  }
+
   // A very basic markdown formatter for bold and code blocks, with 'marked' feature
   function formatMarkdown(text) {
+     text = preprocessMangledCharts(text);
     if (window.marked) {
+      // Configure marked to handle custom types if needed
       return marked.parse(text);
     }
+    return text; // fallback
+  }
+
+  function renderChartsInElement(element) {
+    if (!window.frappe) return;
     
-    let formatted = text
-      .replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;") // sanitize
-      .replace(/\*\*(.*?)\*\*/g, '<strong>$1</strong>')
-      .replace(/\*(.*?)\*/g, '<em>$1</em>')
-      .replace(/```([\s\S]*?)```/g, '<pre><code>$1</code></pre>')
-      .replace(/`(.*?)`/g, '<code>$1</code>')
-      .replace(/\n/g, '<br>');
-    return formatted;
+    const codeBlocks = element.querySelectorAll('pre code.language-chart');
+    codeBlocks.forEach(block => {
+      const pre = block.parentElement;
+      const container = document.createElement('div');
+      container.className = 'chart-render-container';
+      
+      try {
+        const chartData = JSON.parse(block.innerText.trim());
+        
+        // Normalize schema for small models
+        let dataObj = chartData.data || {};
+        if (!dataObj.datasets && dataObj.values) {
+            dataObj.datasets = [{ values: dataObj.values }];
+        }
+        if (!dataObj.labels && chartData.labels) dataObj.labels = chartData.labels;
+        if (!dataObj.datasets && chartData.datasets) dataObj.datasets = chartData.datasets;
+        
+        pre.parentNode.insertBefore(container, pre);
+        
+        new frappe.Chart(container, {
+          title: chartData.title || "",
+          data: dataObj,
+          type: chartData.type || "bar",
+          height: chartData.height || 250,
+          colors: chartData.colors || ['#3b82f6', '#10b981', '#ef4444', '#f59e0b'],
+          lineOptions: { hideDots: 1, regionFill: 1 },
+          axisOptions: { xIsSeries: 1 }
+        });
+        
+        // Rendered perfectly, hide the raw code.
+        pre.style.display = 'none';
+      } catch (err) {
+        console.error("Chart Render Error:", err);
+        container.remove();
+      }
+    });
   }
 
   chatForm.addEventListener('submit', async (e) => {
@@ -759,21 +1052,22 @@ document.addEventListener('DOMContentLoaded', () => {
 
     // Add user msg to UI
     let finalPayloadContent = null;
-    let hasImages = pendingAttachments.some(a => a.isImage);
+    const activeSources = pendingAttachments.filter(a => a.enabled);
+    let hasImages = activeSources.some(a => a.isImage);
 
     let uiUserText = text;
     let combinedTextPayload = text;
     
-    if (pendingAttachments.length > 0) {
-       uiUserText += '\n\n*Attachments: ' + pendingAttachments.map(a => a.name).join(', ') + '*';
+    if (activeSources.length > 0) {
+       uiUserText += '\n\n*Active Sources: ' + activeSources.map(a => a.name).join(', ') + '*';
        
-       pendingAttachments.filter(a => !a.isImage).forEach(att => {
+       activeSources.filter(a => !a.isImage).forEach(att => {
           combinedTextPayload += `\n\n[USER ATTACHED FILE - '${att.name}']:\n\`\`\`\n${att.content}\n\`\`\``;
        });
 
        if (hasImages) {
           finalPayloadContent = [{ type: "text", text: combinedTextPayload }];
-          pendingAttachments.filter(a => a.isImage).forEach(att => {
+          activeSources.filter(a => a.isImage).forEach(att => {
              finalPayloadContent.push({
                 type: "image_url",
                 image_url: { url: att.content }
@@ -782,9 +1076,6 @@ document.addEventListener('DOMContentLoaded', () => {
        } else {
           finalPayloadContent = combinedTextPayload;
        }
-
-       pendingAttachments = [];
-       renderAttachments();
     } else {
        finalPayloadContent = text;
     }
@@ -797,6 +1088,9 @@ document.addEventListener('DOMContentLoaded', () => {
     let sysPrompt = systemPromptInput.value;
     if (liveModeEnabled) {
        sysPrompt += "\n\n[LIVE MODE ACTIVE]: We are currently engaged in a real-time vocal conversation. You MUST keep your responses extremely concise, conversational, and engaging. Speak as if we are on a phone call. Avoid lengthy paragraphs, markdown formatting, or bulleted lists unless explicitly asked for more detail.";
+    }
+    if (webAccessEnabled) {
+       sysPrompt += "\n\n[WEB SEARCH TOOL ENABLED]: You have access to a 'search_web' tool function. You MUST execute this tool whenever the user asks for current prices, real-time news, live data, or anything you do not know. DO NOT use [X] placeholders or say you can't fetch data—use the tool!";
     }
     const fullSystemMessage = `${sysPrompt}\n\nPAGE CONTEXT:\n${pageContext}`;
 
@@ -862,6 +1156,7 @@ document.addEventListener('DOMContentLoaded', () => {
       const decoder = new TextDecoder("utf-8");
       let botFullText = "";
       let sentenceBuffer = "";
+      let spokenTextLength = 0;
       isGenerating = true;
       let toolCallsList = {};
 
@@ -896,14 +1191,22 @@ document.addEventListener('DOMContentLoaded', () => {
                     botFullText += newText;
                     
                     if (liveModeEnabled && !liveMuted) {
-                      sentenceBuffer += newText;
-                      let match;
-                      while ((match = sentenceBuffer.match(/([^\.!\?\n]+[\.!\?\n]+)(\s|$)/))) {
-                        const fullMatch = match[0];
-                        const textToSpeak = fullMatch.replace(/[\*`#_]/g, '').trim();
-                        if (textToSpeak) { speakSentence(textToSpeak); }
-                        sentenceBuffer = sentenceBuffer.substring(match.index + fullMatch.length);
-                      }
+                       // Strip out ALL code blocks so we never speak JSON/code natively
+                       const cleanText = botFullText.replace(/```[\s\S]*?(?:```|$)/g, '');
+                       
+                       if (cleanText.length > spokenTextLength) {
+                           const newCleanText = cleanText.substring(spokenTextLength);
+                           sentenceBuffer += newCleanText;
+                           spokenTextLength = cleanText.length;
+                           
+                           let match;
+                           while ((match = sentenceBuffer.match(/([^\.!\?\n]+[\.!\?\n]+)(\s|$)/))) {
+                             const fullMatch = match[0];
+                             const textToSpeak = fullMatch;
+                             if (textToSpeak) { speakSentence(textToSpeak); }
+                             sentenceBuffer = sentenceBuffer.substring(match.index + fullMatch.length);
+                           }
+                       }
                     }
                     if (botFullText.includes('<|tool_call>')) {
                         aiContentDiv.innerHTML = '<em>⚙️ Preparing tool interaction...</em>';
@@ -975,9 +1278,10 @@ document.addEventListener('DOMContentLoaded', () => {
       // Finished normally
       if (botFullText.trim() !== "") {
          if (liveModeEnabled && !liveMuted && sentenceBuffer.trim() !== "") {
-            speakSentence(sentenceBuffer.replace(/[\*`#_]/g, '').trim());
+            speakSentence(sentenceBuffer);
          }
          aiContentDiv.innerHTML = formatMarkdown(botFullText);
+         renderChartsInElement(aiContentDiv);
          messages.push({ role: "assistant", content: botFullText });
          saveChatMemory();
       } else if (botFullText.trim() === "" && validToolCalls.length === 0) {
@@ -1004,9 +1308,13 @@ document.addEventListener('DOMContentLoaded', () => {
   }
 
   // Background integration for Auto-Context
-  chrome.runtime.onMessage.addListener((msg) => {
+  chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
      if (msg.action === "contextChanged") {
         updateContextSilently();
+     } else if (msg.action === "ping") {
+        sendResponse({ status: "alive" });
+     } else if (msg.action === "closeSidePanel") {
+        window.close();
      }
   });
   
@@ -1023,4 +1331,7 @@ document.addEventListener('DOMContentLoaded', () => {
         loadPageContext(false);
      });
   }
+
+  // Initial Load
+  loadChatMemory();
 });
